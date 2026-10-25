@@ -1,0 +1,12 @@
+# One package per line. Lines starting with # are ignored.
+# Workflow: run list-packages.bat, read packages-system.txt, then UNCOMMENT only what you recognise.
+# Disable a few at a time and check the TV still behaves. restore.bat undoes all of it.
+#
+# Android TV / Google TV recommendation + ad rows (safe on most devices):
+#com.google.android.tvrecommendations
+#
+# Stock Google launcher. ONLY after ANIMEVERSE is confirmed working and set as Home.
+# If your Vision Plus uses its own launcher, run find-stock-launcher.bat and use that package name instead.
+#com.google.android.tvlauncher
+#
+# Vendor (VEERSUI) promo / news / ad apps: add the package names you find in packages-system.txt here.
