@@ -1,52 +1,66 @@
 package com.animeverse.launcher
 
 import android.app.Activity
+import android.app.role.RoleManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
-import android.net.ConnectivityManager
-import android.net.Network
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.ImageView
-import android.widget.LinearLayout
 import android.widget.TextClock
-import android.widget.TextView
 import android.widget.Toast
 import java.io.File
 import java.io.FileInputStream
 import java.io.IOException
 import java.io.InputStream
 
+/**
+ * ANIMEVERSE Home. The artwork (wallpaper.jpg) already contains the painted menu and app tiles,
+ * so this screen draws nothing except a live clock. Invisible focusable areas sit exactly over
+ * each painted tile/menu row and show a warm-white focus ring when the remote lands on them.
+ * Result: the exact theme, very little RAM, no per-frame work.
+ */
 class MainActivity : Activity() {
+
+    // Design space of the artwork (1672 x 941). Everything is positioned in these units.
+    private val DW = 1672f
+    private val DH = 941f
+
+    private class AppSlot(val name: String, val x1: Int, val x2: Int, vararg val pkgs: String)
 
     private val ui = Handler(Looper.getMainLooper())
     private var W = 0
     private var H = 0
+    private var sx = 1f
+    private var sy = 1f
+    private lateinit var root: FrameLayout
     private lateinit var wall: ImageView
-    private lateinit var dock: LinearLayout
-    private lateinit var wifi: ImageView
-    private var apps: List<AppEntry> = emptyList()
-    private var dockKey = ""
+    private var firstTile: View? = null
     private var started = false
-    private var netCb: ConnectivityManager.NetworkCallback? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val dm = resources.displayMetrics
         W = dm.widthPixels
         H = dm.heightPixels
-        getExternalFilesDir(null) // creates the folder used for the wallpaper override
+        sx = W / DW
+        sy = H / DH
+        getExternalFilesDir(null) // creates the folder used for the optional wallpaper override
         setContentView(build())
     }
 
@@ -54,245 +68,141 @@ class MainActivity : Activity() {
         super.onStart()
         started = true
         loadWallpaper()
-        watchNetwork()
     }
 
     override fun onResume() {
         super.onResume()
-        Apps.load(this) { list ->
-            if (isDestroyed) return@load
-            apps = list
-            fillDock()
+        if (currentFocus == null) firstTile?.requestFocus()
+        val sp = getSharedPreferences("av", MODE_PRIVATE)
+        if (!isDefaultHome() && !sp.getBoolean("asked_home", false)) {
+            sp.edit().putBoolean("asked_home", true).apply()
+            ui.postDelayed({ if (started) requestDefaultHome() }, 600)
         }
     }
 
     override fun onStop() {
         super.onStop()
         started = false
-        // Free the big bitmap while another app is in front.
-        wall.setImageDrawable(null)
-        val cm = getSystemService(ConnectivityManager::class.java)
-        netCb?.let { try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {} }
-        netCb = null
+        wall.setImageDrawable(null) // free the bitmap while another app is in front
     }
 
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
-        // Home pressed while already home: jump back to the first tile.
-        if (::dock.isInitialized) dock.getChildAt(0)?.requestFocus()
+        firstTile?.requestFocus() // Home pressed while already home
     }
 
     @Deprecated("Launcher must never exit")
     override fun onBackPressed() { /* stay on Home */ }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_MENU) { // remote MENU button = clean memory
+            cleanNow()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
     // ---------------------------------------------------------------- UI
 
     private fun build(): View {
-        val root = FrameLayout(this).apply {
-            setBackgroundColor(Color.BLACK)
-            clipChildren = false
-            clipToPadding = false
-        }
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         wall = ImageView(this).apply {
-            scaleType = ImageView.ScaleType.CENTER_CROP
-            // Themed fallback (sunset / blue / crimson / blossom) when no wallpaper file is present.
+            scaleType = ImageView.ScaleType.FIT_XY // 16:9 art on a 16:9 TV; keeps overlay math exact
             background = GradientDrawable(
                 GradientDrawable.Orientation.LEFT_RIGHT,
-                intArrayOf(0xFF7A3A0A.toInt(), 0xFF1A2F7A.toInt(), 0xFF1B2A6B.toInt(), 0xFF7A1020.toInt(), 0xFFD98BAA.toInt()),
+                intArrayOf(0xFF7A3A0A.toInt(), 0xFF1A2F7A.toInt(), 0xFF7A1020.toInt(), 0xFFD98BAA.toInt()),
             )
         }
         root.addView(wall, FrameLayout.LayoutParams(-1, -1))
 
-        // Bottom scrim keeps tiles and text legible on any artwork.
-        root.addView(View(this).apply {
-            background = GradientDrawable(
-                GradientDrawable.Orientation.TOP_BOTTOM,
-                intArrayOf(0x00000000, 0x00000000, 0xD0000000.toInt()),
-            )
-        }, FrameLayout.LayoutParams(-1, -1))
-
-        root.addView(statusBar(), FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
-            topMargin = (H * 0.025f).toInt()
-            marginEnd = (W * 0.025f).toInt()
-        })
-        root.addView(navPanel(), FrameLayout.LayoutParams((W * 0.15f).toInt(), -2, Gravity.TOP or Gravity.START).apply {
-            leftMargin = (W * 0.02f).toInt()
-            topMargin = (H * 0.44f).toInt()
-        })
-        root.addView(titleBlock(), FrameLayout.LayoutParams(-1, -2, Gravity.TOP).apply {
-            topMargin = (H * 0.575f).toInt()
-            leftMargin = (W * 0.17f).toInt()
-            rightMargin = (W * 0.17f).toInt()
-        })
-
-        dock = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            clipChildren = false
-            clipToPadding = false
+        // ---- App dock (painted tiles, y 711..799)
+        val dock = listOf(
+            AppSlot("Netflix", 248, 385, "com.netflix.ninja"),
+            AppSlot("YouTube", 398, 553, "com.google.android.youtube.tv", "com.google.android.youtube"),
+            AppSlot("Disney+", 566, 694, "com.disney.disneyplus"),
+            AppSlot("Prime Video", 706, 833, "com.amazon.amazonvideo.livingroom", "com.amazon.avod.thirdpartyclient"),
+            AppSlot("Apple TV", 845, 962, "com.apple.atve.androidtv.appletv"),
+            AppSlot("Max", 974, 1092, "com.wbd.stream", "com.hbo.hbonow"),
+            AppSlot("Crunchyroll", 1104, 1237, "com.crunchyroll.crunchyroid"),
+            AppSlot("Spotify", 1249, 1393, "com.spotify.tv.android", "com.spotify.music"),
+        )
+        for ((i, a) in dock.withIndex()) {
+            val v = slot(a.x1, 711, a.x2, 799, 10f, { open(a.name, *a.pkgs) })
+            if (i == 0) firstTile = v
         }
-        root.addView(dock, FrameLayout.LayoutParams((W * 0.79f).toInt(), -2, Gravity.BOTTOM or Gravity.START).apply {
-            leftMargin = (W * 0.17f).toInt()
-            bottomMargin = (H * 0.09f).toInt()
+        slot(1408, 711, 1613, 799, 10f, { openAllApps() }) // More Apps
+
+        // ---- Left menu (painted panel, rows 52 px tall)
+        slot(50, 418, 292, 470, 14f, { firstTile?.requestFocus() }, { requestDefaultHome() }) // Home (hold OK = set default)
+        slot(50, 478, 292, 530, 14f, { open("Netflix", "com.netflix.ninja") })                // TV Shows
+        slot(50, 534, 292, 586, 14f, { open("Prime Video", "com.amazon.amazonvideo.livingroom", "com.amazon.avod.thirdpartyclient") }) // Movies
+        slot(50, 589, 292, 641, 14f, { open("Crunchyroll", "com.crunchyroll.crunchyroid") })  // Anime
+        slot(50, 644, 292, 696, 14f, { openAllApps() })                                        // Apps
+        slot(50, 699, 292, 751, 14f, { openSettings() })                                       // Settings
+
+        // ---- Top-right: search + settings are painted, clock is live
+        slot(1338, 28, 1376, 66, 19f, { openSearch() })
+        slot(1406, 28, 1444, 66, 19f, { openSettings() })
+        val clock = TextClock(this).apply {
+            format12Hour = "h:mm a"
+            format24Hour = "h:mm a"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, 23f * sy)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            gravity = Gravity.END or Gravity.CENTER_VERTICAL
+        }
+        root.addView(clock, FrameLayout.LayoutParams(((1642 - 1500) * sx).toInt(), (34 * sy).toInt()).apply {
+            leftMargin = (1500 * sx).toInt()
+            topMargin = (30 * sy).toInt()
         })
         return root
     }
 
-    private fun statusBar(): View {
-        val icon = (H * 0.032f).toInt()
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        bar.addView(iconButton(R.drawable.ic_search, icon) { openSearch() })
-        bar.addView(iconButton(R.drawable.ic_settings, icon) { openSettings() })
-        wifi = ImageView(this).apply {
-            setImageResource(R.drawable.ic_wifi)
-            alpha = 0.3f
-        }
-        bar.addView(wifi, LinearLayout.LayoutParams(icon, icon).apply {
-            marginStart = (icon * 0.3f).toInt()
-            marginEnd = (icon * 0.5f).toInt()
-        })
-        bar.addView(TextClock(this).apply {
-            format12Hour = "h:mm a"
-            format24Hour = "h:mm a"
-            setTextColor(Ui.WARM_WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, H * 0.027f)
-            setShadowLayer(6f, 0f, 2f, 0xAA000000.toInt())
-        })
-        return bar
-    }
-
-    private fun iconButton(res: Int, size: Int, onClick: () -> Unit): View {
-        val pad = (size * 0.3f).toInt()
-        return ImageView(this).apply {
-            setImageResource(res)
-            setPadding(pad, pad, pad, pad)
-            background = Ui.states(ColorDrawable(0), Ui.rounded(0x55FFFFFF, size.toFloat()))
-            isFocusable = true
-            isClickable = true
-            layoutParams = LinearLayout.LayoutParams(size + pad * 2, size + pad * 2)
-            setOnClickListener { onClick() }
-        }
-    }
-
-    private fun navPanel(): View {
-        val pad = (H * 0.012f).toInt()
-        val rowH = (H * 0.066f).toInt()
-        val panel = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            background = Ui.rounded(0xAA000000.toInt(), H * 0.014f)
-        }
-        panel.addView(navRow(R.drawable.ic_home, "Home", true, rowH) { dock.getChildAt(0)?.requestFocus() })
-        panel.addView(navRow(R.drawable.ic_apps, "Apps", false, rowH) { openAllApps() })
-        panel.addView(navRow(R.drawable.ic_bolt, "Clean", false, rowH) {
-            Toast.makeText(this, "Cleaning…", Toast.LENGTH_SHORT).show()
-            Apps.clean(this) { freed ->
-                Toast.makeText(this, "Freed ${freed / 1048576} MB", Toast.LENGTH_SHORT).show()
-            }
-        })
-        panel.addView(navRow(R.drawable.ic_settings, "Settings", false, rowH) { openSettings() })
-        return panel
-    }
-
-    private fun navRow(res: Int, text: String, active: Boolean, rowH: Int, onClick: () -> Unit): View {
-        val r = H * 0.012f
-        val icon = (H * 0.028f).toInt()
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            val p = (H * 0.016f).toInt()
-            setPadding(p, 0, p, 0)
+    /** Invisible focus target at design coordinates; shows a ring + faint wash when focused. */
+    private fun slot(
+        x1: Int, y1: Int, x2: Int, y2: Int, radius: Float,
+        onClick: () -> Unit, onLong: (() -> Unit)? = null,
+    ): View {
+        val r = radius * sy
+        val v = View(this).apply {
             background = Ui.states(
                 ColorDrawable(0),
-                Ui.rounded(0x99CC5500.toInt(), r, Ui.PEACH, 2),
-                Ui.rounded(0x44CC5500, r),
+                Ui.rounded(0x26FFF1E0, r, Ui.WARM_WHITE, maxOf(3, (3 * sy).toInt())),
             )
-            isSelected = active
             isFocusable = true
             isClickable = true
-            layoutParams = LinearLayout.LayoutParams(-1, rowH)
-            addView(ImageView(this@MainActivity).apply { setImageResource(res) }, LinearLayout.LayoutParams(icon, icon))
-            addView(TextView(this@MainActivity).apply {
-                this.text = text
-                setTextColor(Color.WHITE)
-                setTextSize(TypedValue.COMPLEX_UNIT_PX, H * 0.024f)
-                setSingleLine()
-                setPadding((H * 0.016f).toInt(), 0, 0, 0)
-            })
             setOnClickListener { onClick() }
+            if (onLong != null) setOnLongClickListener { onLong(); true }
         }
-    }
-
-    private fun titleBlock(): View {
-        val box = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-        }
-        box.addView(TextView(this).apply {
-            text = "アニメの世界"
-            setTextColor(Ui.WARM_WHITE)
-            typeface = Typeface.create("serif", Typeface.BOLD)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, H * 0.058f)
-            setShadowLayer(14f, 0f, 4f, 0xCC000000.toInt())
-            gravity = Gravity.CENTER
+        root.addView(v, FrameLayout.LayoutParams(((x2 - x1) * sx).toInt(), ((y2 - y1) * sy).toInt()).apply {
+            leftMargin = (x1 * sx).toInt()
+            topMargin = (y1 * sy).toInt()
         })
-        box.addView(TextView(this).apply {
-            text = "DIFFERENT WORLDS · ONE SCREEN"
-            setTextColor(0xCCFFFFFF.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, H * 0.015f)
-            letterSpacing = 0.35f
-            setShadowLayer(6f, 0f, 2f, 0xCC000000.toInt())
-            gravity = Gravity.CENTER
-        })
-        box.addView(View(this).apply {
-            background = Ui.rounded(0xFFD81E2B.toInt(), 6f)
-        }, LinearLayout.LayoutParams((W * 0.11f).toInt(), maxOf(3, (H * 0.004f).toInt())).apply {
-            topMargin = (H * 0.012f).toInt()
-        })
-        return box
-    }
-
-    // ---------------------------------------------------------------- Dock
-
-    private fun fillDock() {
-        val byPkg = apps.associateBy { it.pkg }
-        val items = Pins.get(this).mapNotNull { byPkg[it] }.take(Pins.MAX)
-        val key = items.joinToString(",") { it.pkg }
-        if (key == dockKey) return // nothing changed: don't rebuild, don't lose focus
-        dockKey = key
-
-        val keepFocus = dock.hasFocus() || currentFocus == null
-        val idx = dock.indexOfChild(dock.focusedChild).coerceAtLeast(0)
-        dock.removeAllViews()
-
-        val n = items.size + 1
-        val gap = (W * 0.008f).toInt()
-        val w = minOf((W * 0.79f).toInt().minus(gap * (n - 1)) / n, (W * 0.115f).toInt())
-        val h = (w * 0.62f).toInt()
-
-        for (e in items) {
-            val tile = Ui.appTile(this, e, w, h)
-            tile.setOnClickListener { Apps.launch(this, e) }
-            tile.setOnLongClickListener {
-                Pins.toggle(this, e.pkg) // long-press a dock tile to remove it
-                dockKey = ""
-                fillDock()
-                true
-            }
-            dock.addView(tile, LinearLayout.LayoutParams(w, h).apply { marginEnd = gap })
-        }
-        val more = Ui.iconTile(this, R.drawable.ic_apps, "More Apps", w, h)
-        more.setOnClickListener { openAllApps() }
-        dock.addView(more, LinearLayout.LayoutParams(w, h))
-
-        if (keepFocus) dock.getChildAt(idx.coerceAtMost(dock.childCount - 1))?.requestFocus()
+        return v
     }
 
     // ---------------------------------------------------------------- Actions
+
+    private fun open(name: String, vararg pkgs: String) {
+        for (p in pkgs) {
+            val i = packageManager.getLeanbackLaunchIntentForPackage(p)
+                ?: packageManager.getLaunchIntentForPackage(p)
+            if (i != null) {
+                Apps.clean(this, null) // free RAM first, off the main thread
+                try {
+                    startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                } catch (_: Exception) {
+                    Toast.makeText(this, "Cannot open $name", Toast.LENGTH_SHORT).show()
+                }
+                return
+            }
+        }
+        Toast.makeText(this, "$name is not installed", Toast.LENGTH_SHORT).show()
+        try { // offer it in the Play Store if the TV has one
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=${pkgs[0]}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {}
+    }
 
     private fun openAllApps() = startActivity(Intent(this, AllAppsActivity::class.java))
 
@@ -312,12 +222,48 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun cleanNow() {
+        Toast.makeText(this, "Cleaning…", Toast.LENGTH_SHORT).show()
+        Apps.clean(this) { freed ->
+            Toast.makeText(this, "Freed ${freed / 1048576} MB", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ---------------------------------------------------------------- Default Home
+
+    private fun isDefaultHome(): Boolean {
+        val ri = packageManager.resolveActivity(
+            Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME),
+            PackageManager.MATCH_DEFAULT_ONLY,
+        )
+        return ri?.activityInfo?.packageName == packageName
+    }
+
+    /** Tries the Android "make this your Home app" dialog, then the Home settings screen. */
+    private fun requestDefaultHome() {
+        try {
+            if (Build.VERSION.SDK_INT >= 29) {
+                val rm = getSystemService(RoleManager::class.java)
+                if (rm != null && rm.isRoleAvailable(RoleManager.ROLE_HOME) && !rm.isRoleHeld(RoleManager.ROLE_HOME)) {
+                    startActivityForResult(rm.createRequestRoleIntent(RoleManager.ROLE_HOME), 1)
+                    return
+                }
+            }
+        } catch (_: Exception) {}
+        try {
+            startActivity(Intent(Settings.ACTION_HOME_SETTINGS))
+            return
+        } catch (_: Exception) {}
+        Toast.makeText(this, "This TV does not allow changing the Home app from here", Toast.LENGTH_LONG).show()
+    }
+
     // ---------------------------------------------------------------- Wallpaper
 
     /**
-     * Wallpaper source, first match wins:
-     *  1. /sdcard/Android/data/com.animeverse.launcher/files/wallpaper.jpg  (pushed over adb, no rebuild)
-     *  2. app/src/main/assets/wallpaper.jpg | .webp | .png                  (bundled)
+     * Artwork source, first match wins:
+     *  1. /sdcard/Android/data/com.animeverse.launcher/files/wallpaper.jpg  (push over adb, no rebuild;
+     *     must contain the same painted menu/dock layout or the focus areas will not line up)
+     *  2. bundled assets/wallpaper.jpg (the ANIMEVERSE theme)
      */
     private fun openWallpaper(): InputStream? {
         val ext = File(getExternalFilesDir(null), "wallpaper.jpg")
@@ -343,25 +289,7 @@ class MainActivity : Activity() {
     private fun loadWallpaper() {
         Thread {
             val bmp = try { decodeWallpaper() } catch (_: Throwable) { null }
-            ui.post {
-                if (started && !isDestroyed && bmp != null) wall.setImageBitmap(bmp)
-            }
+            ui.post { if (started && !isDestroyed && bmp != null) wall.setImageBitmap(bmp) }
         }.start()
-    }
-
-    // ---------------------------------------------------------------- Network indicator
-
-    private fun watchNetwork() {
-        val cm = getSystemService(ConnectivityManager::class.java)
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { ui.post { wifi.alpha = 1f } }
-            override fun onLost(network: Network) { ui.post { wifi.alpha = 0.3f } }
-        }
-        try {
-            cm.registerDefaultNetworkCallback(cb)
-            netCb = cb
-        } catch (_: Exception) {
-            wifi.alpha = 1f
-        }
     }
 }

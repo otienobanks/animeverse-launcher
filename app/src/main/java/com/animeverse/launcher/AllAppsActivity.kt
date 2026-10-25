@@ -11,7 +11,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import android.widget.Toast
 
 /** Plain ScrollView + rows of focusable tiles: D-pad navigation is native, no adapters, no libraries. */
 class AllAppsActivity : Activity() {
@@ -36,14 +35,6 @@ class AllAppsActivity : Activity() {
         }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.START).apply {
             leftMargin = (W * 0.05f).toInt()
             topMargin = (H * 0.05f).toInt()
-        })
-        root.addView(TextView(this).apply {
-            text = "Hold OK on an app to pin / unpin it on Home (first ${Pins.MAX} pinned are shown)"
-            setTextColor(0x99FFFFFF.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, H * 0.018f)
-        }, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply {
-            rightMargin = (W * 0.05f).toInt()
-            topMargin = (H * 0.065f).toInt()
         })
 
         grid = LinearLayout(this).apply {
@@ -72,7 +63,6 @@ class AllAppsActivity : Activity() {
         val gap = (W * 0.012f).toInt()
         val w = ((W * 0.9f).toInt() - gap * (cols - 1)) / cols
         val h = (w * 0.62f).toInt()
-        val pinned = Pins.get(this).toSet()
 
         for (chunk in list.chunked(cols)) {
             val row = LinearLayout(this).apply {
@@ -81,21 +71,7 @@ class AllAppsActivity : Activity() {
             }
             for ((i, e) in chunk.withIndex()) {
                 val tile = Ui.appTile(this, e, w, h)
-                val dotSize = (h * 0.14f).toInt()
-                val dot = Ui.pinDot(this, h).apply {
-                    visibility = if (e.pkg in pinned) View.VISIBLE else View.GONE
-                }
-                tile.addView(dot, FrameLayout.LayoutParams(dotSize, dotSize, Gravity.TOP or Gravity.END).apply {
-                    topMargin = (h * 0.06f).toInt()
-                    marginEnd = (h * 0.06f).toInt()
-                })
                 tile.setOnClickListener { Apps.launch(this, e) }
-                tile.setOnLongClickListener {
-                    val on = Pins.toggle(this, e.pkg)
-                    dot.visibility = if (on) View.VISIBLE else View.GONE
-                    Toast.makeText(this, if (on) "Pinned to Home" else "Removed from Home", Toast.LENGTH_SHORT).show()
-                    true
-                }
                 row.addView(tile, LinearLayout.LayoutParams(w, h).apply { if (i < cols - 1) marginEnd = gap })
             }
             grid.addView(row, LinearLayout.LayoutParams(-2, h).apply { bottomMargin = gap })
